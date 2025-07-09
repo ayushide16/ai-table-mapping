@@ -1,90 +1,130 @@
 import re
+import json
 import csv
-import pandas as pd
-from io import StringIO
 from datasets import load_dataset
+from collections import defaultdict
 
-# Load dataset
-ds = load_dataset("gretelai/synthetic_text_to_sql", split="train")
+def extract_table_instances_from_hf_dataset(dataset_name: str, split: str = "train") -> list:
+    """
+    Loads a Hugging Face dataset, extracts SQL schemas from 'sql_context' field,
+    and returns details for each table instance found, including its domain, sql_context,
+    column names, and data types.
 
-# Prepare data structures
-all_tables = {}
-all_samples = {}
-all_fks = {}
+    Args:
+        dataset_name (str): The name of the dataset on Hugging Face (e.g., "gretelai/synthetic_text_to_sql").
+        split (str): The dataset split to analyze (e.g., "train", "test", "validation").
 
-for entry in ds:
-    domain = entry["domain"]
-    sql = entry["sql_context"]
-    queries = [q.strip() for q in sql.strip().split(';') if q.strip()]
+    Returns:
+        list: A list of dictionaries, each containing 'table_name', 'domain', 'sql_context',
+              'column_name', and 'data_type' for each column found within a CREATE TABLE statement.
+              Duplicate records are included if a table appears multiple times or has multiple columns.
+    """
+    print(f"Attempting to load dataset: '{dataset_name}', split: '{split}'...")
+    try:
+        dataset = load_dataset(dataset_name, split=split)
+        print(f"Dataset loaded successfully. Number of records in '{split}' split: {len(dataset)}")
+    except Exception as e:
+        print(f"Error loading dataset: {e}")
+        print("Please ensure the dataset name and split are correct, and you have an internet connection.")
+        return [] # Return an empty list if dataset loading fails
 
-    for q in queries:
-        if q.upper().startswith("CREATE SCHEMA"):
-            continue
+    extracted_instances = [] # List to store all extracted instances
 
-        if q.upper().startswith("CREATE TABLE"):
-            m = re.match(r"CREATE TABLE(?: IF NOT EXISTS)? ([\w\.]+)\s*\((.*)\)", q, re.IGNORECASE | re.DOTALL)
-            if not m: continue
-            full_table, raw_cols = m.groups()
-            table = full_table.split('.')[-1]
-            raw_cols = raw_cols.replace('\n',' ').strip()
-            cols = re.split(r',(?![^()]*\))', raw_cols)
-            all_tables.setdefault(table, []).append((cols, domain))
+    # Regex to find CREATE TABLE statements and extract table name and column definitions
+    create_table_regex = re.compile(
+        r"CREATE TABLE\s+(?:IF NOT EXISTS\s+)?`?(\w+)`?\s*\((.*?)\);",
+        re.DOTALL | re.IGNORECASE
+    )
 
-        elif q.upper().startswith("INSERT INTO"):
-            m = re.match(r"INSERT INTO ([\w\.]+)\s*\(([^)]+)\)\s*VALUES\s*(.+)", q, re.IGNORECASE | re.DOTALL)
-            if not m: continue
-            full_table, col_str, val_str = m.groups()
-            table = full_table.split('.')[-1]
-            cols = [c.strip() for c in col_str.split(',')]
-            rows = re.findall(r"\(([^)]+)\)", val_str)
-            if not rows: continue
-            row = rows[0]
-            reader = csv.reader(StringIO(row), skipinitialspace=True)
-            vals = [v.strip().strip("'") for v in next(reader)]
-            all_samples.setdefault(table, {})[tuple(cols)] = dict(zip(cols, vals))
+    # Regex to find column names and their data types within the column definitions.
+    # It handles optional backticks, various data type formats (e.g., VARCHAR(50), DECIMAL(10,2)),
+    # and common column constraints (PRIMARY KEY, UNIQUE, NOT NULL, DEFAULT).
+    column_regex = re.compile(
+        r"`?(\w+)`?\s+([A-Z]+(?:(?:\s*\(\d+(?:,\s*\d+)?\))|\s*\(.*?\))*\s*(?:(?:PRIMARY\s+KEY|UNIQUE|NOT\s+NULL|DEFAULT\s+.*?)(?:\s+|$))*?)",
+        re.IGNORECASE
+    )
 
-# Build metadata
-rows = []
-for table, entries in all_tables.items():
-    for cols_list, domain in entries:
-        fk_map = {}
-        columns = []
-        for col_def in cols_list:
-            cd = col_def.strip()
-            fk = re.match(r"FOREIGN KEY\s*\((\w+)\)\s+REFERENCES\s+([\w\.]+)", cd, re.IGNORECASE)
-            if fk:
-                colname, ref = fk.groups()
-                fk_map[colname] = ref.split('.')[-1]
-                continue
-            parts = cd.split(None,2)
-            if len(parts) < 2: continue
-            cname, dt = parts[0], parts[1]
-            constraint = parts[2] if len(parts)==3 else ""
-            columns.append((cname, dt, constraint))
+    for i, record in enumerate(dataset):
+        sql_context = record.get('sql_context', '')
+        domain = record.get('domain', '') # Capture domain for the current record
+        if not sql_context:
+            continue # Skip records without sql_context
 
-        sample = {}
-        for cols_tuple, smap in all_samples.get(table, {}).items():
-            sample = smap; break
+        # Find all CREATE TABLE statements in the current record's sql_context
+        for table_match in create_table_regex.finditer(sql_context):
+            table_name = table_match.group(1)
+            columns_definition_str = table_match.group(2)
+            
+            # Robustly split columns_definition_str by comma, respecting parentheses balance.
+            column_definitions = []
+            balance = 0
+            current_col_chars = []
+            for char in columns_definition_str:
+                if char == '(':
+                    balance += 1
+                elif char == ')':
+                    balance -= 1
+                elif char == ',' and balance == 0:
+                    column_definitions.append("".join(current_col_chars).strip())
+                    current_col_chars = []
+                    continue
+                current_col_chars.append(char)
+            if current_col_chars: # Add the last column definition
+                column_definitions.append("".join(current_col_chars).strip())
 
-        for cname, dt, constraint in columns:
-            rows.append({
-                "domain": domain,
-                "table_name": table,
-                "column_name": cname,
-                "data_type": dt,
-                "constraint": constraint or "None",
-                "sample_data": sample.get(cname, "—"),
-                "foreign_key": "Yes" if cname in fk_map else "No",
-                "foreign_table": fk_map.get(cname, "—")
-            })
+            # If no columns are found for a table, add a record with empty column/data_type
+            if not column_definitions:
+                extracted_instances.append({
+                    "domain": domain,
+                    "table_name": table_name,
+                    "column_name": "",
+                    "data_type": "",
+                    "sql_context": sql_context
+                })
+            else:
+                for col_def in column_definitions:
+                    if not col_def:
+                        continue
+                    col_match = column_regex.match(col_def)
+                    if col_match:
+                        col_name = col_match.group(1)
+                        data_type = re.sub(r'\s+', ' ', col_match.group(2)).strip()
+                        
+                        # Append the details for each column
+                        extracted_instances.append({
+                            "domain": domain,
+                            "table_name": table_name,
+                            "column_name": col_name,
+                            "data_type": data_type,
+                            "sql_context": sql_context
+                        })
+    
+    return extracted_instances
 
-# Create DataFrame
-df = pd.DataFrame(rows)[[
-    "domain","table_name","column_name","data_type",
-    "constraint","sample_data","foreign_key","foreign_table"
-]]
+if __name__ == "__main__":
+    dataset_to_analyze = "gretelai/synthetic_text_to_sql"
+    split_to_analyze = "train"
 
-# Save
-df.to_csv("table_metadata.csv", index=False)
+    print(f"--- Starting Analysis of '{dataset_to_analyze}' ({split_to_analyze} split) ---")
+    
+    # Call the function to extract all instances
+    extracted_data = extract_table_instances_from_hf_dataset(dataset_to_analyze, split=split_to_analyze)
 
-print("Metadata created and saved.")
+    if extracted_data:
+        output_csv_filename = f"table_metadata.csv"
+        
+        # Define CSV headers to include new column and data type fields
+        fieldnames = ['domain', 'table_name', 'column_name', 'data_type', 'sql_context']
+
+        try:
+            with open(output_csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader() # Write the header row
+                writer.writerows(extracted_data) # Write all data rows
+            print(f"\nSuccessfully stored {len(extracted_data)} records to '{output_csv_filename}' in CSV format.")
+        except Exception as e:
+            print(f"\nError saving data to CSV: {e}")
+    else:
+        print("No table instances could be extracted or dataset is empty/unavailable.")
+
+    print("\n--- Analysis Complete ---")
