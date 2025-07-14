@@ -1,5 +1,5 @@
 import streamlit as st
-from backend import call_gemini
+from query_generator.backend import call_gemini
 
 st.set_page_config(page_title="SQL Query Generator")
 

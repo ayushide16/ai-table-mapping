@@ -1,0 +1,7 @@
+pandas
+sentence-transformers
+faiss-cpu
+google-generativeai
+fastapi
+uvicorn
+python-dotenv  # For loading .env files in local development

@@ -2,8 +2,8 @@
 
 import google.generativeai as genai
 import json
-from config import GEMINI_API_KEY
-from llm_prompt import sql_generation_prompt
+from query_generator.config import GEMINI_API_KEY
+from query_generator.llm_prompt import sql_generation_prompt
 
 def call_gemini(sql_prompt: str, sql_context: str, sql_sample_data: str) -> str:
     try:
